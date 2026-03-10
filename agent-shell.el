@@ -608,7 +608,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-resume nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
-        (cons :active-request-count 0)
+        (cons :active-requests nil)
         (cons :pending-requests nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -1151,7 +1151,7 @@ COMMAND, when present, may be a shell command string or an argv vector."
 
 (defun agent-shell--active-requests-p (state)
   "Return non-nil if STATE has in-flight requests awaiting responses."
-  (not (zerop (map-elt state :active-request-count))))
+  (map-elt state :active-requests))
 
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
@@ -1271,34 +1271,39 @@ COMMAND, when present, may be a shell command string or an argv vector."
               :render-body-images t)
              (map-put! state :last-entry-type "agent_message_chunk")))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "user_message_chunk")
-           (let ((new-prompt-p (not (equal (map-elt state :last-entry-type)
-                                           "user_message_chunk"))))
-             (when new-prompt-p
-               (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
+           ;; Only handle user_message_chunks when there's an active session/load to avoid
+           ;; inserting a redundant shell prompt with the existing user submission.
+           (when (seq-find (lambda (r)
+                             (equal (map-elt r :method) "session/load"))
+                           (map-elt state :active-requests))
+             (let ((new-prompt-p (not (equal (map-elt state :last-entry-type)
+                                             "user_message_chunk"))))
+               (when new-prompt-p
+                 (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
+                 (agent-shell--append-transcript
+                  :text (format "## User (%s)\n\n" (format-time-string "%F %T"))
+                  :file-path agent-shell--transcript-file))
                (agent-shell--append-transcript
-                :text (format "## User (%s)\n\n" (format-time-string "%F %T"))
-                :file-path agent-shell--transcript-file))
-             (agent-shell--append-transcript
-              :text (format "> %s\n"
-                            (agent-shell--indent-markdown-headers
-                             (map-nested-elt acp-notification '(params update content text))))
-              :file-path agent-shell--transcript-file)
-             (agent-shell--update-text
-              :state state
-              :block-id (format "%s-user_message_chunk"
-                                (map-elt state :chunked-group-count))
-              :text (if new-prompt-p
-                        (concat (propertize
-                                 (map-nested-elt
-                                  state '(:agent-config :shell-prompt))
-                                 'font-lock-face 'comint-highlight-prompt)
-                                (propertize (map-nested-elt acp-notification '(params update content text))
-                                            'font-lock-face 'comint-highlight-input))
-                      (propertize (map-nested-elt acp-notification '(params update content text))
-                                  'font-lock-face 'comint-highlight-input))
-              :create-new new-prompt-p
-              :append t))
-           (map-put! state :last-entry-type "user_message_chunk"))
+                :text (format "> %s\n"
+                              (agent-shell--indent-markdown-headers
+                               (map-nested-elt acp-notification '(params update content text))))
+                :file-path agent-shell--transcript-file)
+               (agent-shell--update-text
+                :state state
+                :block-id (format "%s-user_message_chunk"
+                                  (map-elt state :chunked-group-count))
+                :text (if new-prompt-p
+                          (concat (propertize
+                                   (map-nested-elt
+                                    state '(:agent-config :shell-prompt))
+                                   'font-lock-face 'comint-highlight-prompt)
+                                  (propertize (map-nested-elt acp-notification '(params update content text))
+                                              'font-lock-face 'comint-highlight-input))
+                        (propertize (map-nested-elt acp-notification '(params update content text))
+                                    'font-lock-face 'comint-highlight-input))
+                :create-new new-prompt-p
+                :append t))
+             (map-put! state :last-entry-type "user_message_chunk")))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "plan")
            (agent-shell--update-fragment
             :state state
@@ -3318,26 +3323,35 @@ DATA is an optional alist of event-specific data."
     nil))
 
 (cl-defun agent-shell--send-request (&key state client request buffer on-success on-failure sync)
-  "Send ACP REQUEST, tracking it in STATE via :active-request-count.
+  "Send ACP REQUEST, tracking it in STATE via :active-requests.
 
-Wraps `acp-send-request' so that :active-request-count is incremented
-while a request is in-flight and decremented on success or failure.
+Wraps `acp-send-request' so that REQUEST is pushed to
+:active-requests while in-flight and removed on success or failure.
 
 CLIENT, REQUEST, BUFFER, ON-SUCCESS, ON-FAILURE, and SYNC are passed
 through to `acp-send-request'."
-  (map-put! state :active-request-count (1+ (map-elt state :active-request-count)))
+  ;; Migrate state for sessions created before :active-requests existed.
+  ;; Without this, map-put! fails on mid-session package updates.
+  (unless (assq :active-requests state)
+    (nconc state (list (cons :active-requests nil))))
+  (map-put! state :active-requests
+            (cons request (map-elt state :active-requests)))
   (acp-send-request
    :client client
    :request request
    :buffer buffer
    :on-success (lambda (acp-response)
-                 (map-put! state :active-request-count
-                           (1- (map-elt state :active-request-count)))
+                 (map-put! state :active-requests
+                           (seq-remove (lambda (r)
+                                         (equal r request))
+                                       (map-elt state :active-requests)))
                  (when on-success
                    (funcall on-success acp-response)))
    :on-failure (lambda (acp-error raw-message)
-                 (map-put! state :active-request-count
-                           (1- (map-elt state :active-request-count)))
+                 (map-put! state :active-requests
+                           (seq-remove (lambda (r)
+                                         (equal r request))
+                                       (map-elt state :active-requests)))
                  (when on-failure
                    (funcall on-failure acp-error raw-message)))
    :sync sync))
