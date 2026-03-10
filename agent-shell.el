@@ -122,6 +122,51 @@ When non-nil, tool use sections are expanded."
   :type 'boolean
   :group 'agent-shell)
 
+(defvar agent-shell-permission-responder-function nil
+  "When non-nil, a function called instead of showing the permission prompt.
+
+When set, the interactive permission dialog is not displayed.
+The function is responsible for calling :respond to approve or reject.
+
+Called with an alist containing:
+
+  :tool-call - the tool call alist with :title, :kind, :status,
+               :permission-request-id, and optionally :diff
+  :options   - enriched actions, each with :kind, :option-id,
+               :label, :option, :char
+  :respond   - function taking an option-id to respond programmatically
+
+See `agent-shell-permission-allow-always' for a built-in handler
+that auto-approves all requests.
+
+Example -- auto-approve reads:
+
+  (setq agent-shell-permission-responder-function
+        (lambda (permission)
+          (when (equal (map-elt (map-elt permission :tool-call) :kind)
+                       \"read\")
+            (when-let ((opt (seq-find
+                             (lambda (o)
+                               (equal (map-elt o :kind) \"allow_once\"))
+                             (map-elt permission :options))))
+              (funcall (map-elt permission :respond)
+                       (map-elt opt :option-id))))))")
+
+(defun agent-shell-permission-allow-always (permission)
+  "Auto-approve all permission requests.
+
+Intended for use with `agent-shell-permission-responder-function'.
+
+Example:
+
+  (setq agent-shell-permission-responder-function
+        #\\='agent-shell-permission-allow-always)"
+  (when-let ((opt (seq-find
+                   (lambda (o) (equal (map-elt o :kind) "allow_once"))
+                   (map-elt permission :options))))
+    (funcall (map-elt permission :respond)
+             (map-elt opt :option-id))))
+
 (defcustom agent-shell-user-message-expand-by-default nil
   "Whether user message sections should be expanded by default.
 
@@ -1494,32 +1539,44 @@ COMMAND, when present, may be a shell command string or an argv vector."
                   (when-let ((diff (agent-shell--make-diff-info
                                     :acp-tool-call (map-nested-elt acp-request '(params toolCall)))))
                     (list (cons :diff diff)))))
-         (when (map-nested-elt acp-request '(params toolCall rawInput plan))
+         (if (functionp agent-shell-permission-responder-function)
+             (funcall agent-shell-permission-responder-function
+                      (list (cons :tool-call (map-nested-elt state (list :tool-calls (map-nested-elt acp-request '(params toolCall toolCallId)))))
+                            (cons :options (agent-shell--make-permission-actions
+                                            (map-nested-elt acp-request '(params options))))
+                            (cons :respond (lambda (option-id)
+                                             (agent-shell--send-permission-response
+                                              :client (map-elt state :client)
+                                              :request-id (map-elt acp-request 'id)
+                                              :option-id option-id
+                                              :state state
+                                              :tool-call-id (map-nested-elt acp-request '(params toolCall toolCallId)))))))
+           (when (map-nested-elt acp-request '(params toolCall rawInput plan))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (concat (map-nested-elt acp-request '(params toolCall toolCallId)) "-plan")
+              :label-left (propertize "Proposed plan" 'font-lock-face 'font-lock-doc-markup-face)
+              :body (map-nested-elt acp-request '(params toolCall rawInput plan))
+              :expanded t))
+           ;; block-id must be the same as the one used
+           ;; in agent-shell--delete-fragment param.
            (agent-shell--update-fragment
             :state state
-            :block-id (concat (map-nested-elt acp-request '(params toolCall toolCallId)) "-plan")
-            :label-left (propertize "Proposed plan" 'font-lock-face 'font-lock-doc-markup-face)
-            :body (map-nested-elt acp-request '(params toolCall rawInput plan))
-            :expanded t))
-         (agent-shell--update-fragment
-          :state state
-          ;; block-id must be the same as the one used
-          ;; in agent-shell--delete-fragment param.
-          :block-id (format "permission-%s" (map-nested-elt acp-request '(params toolCall toolCallId)))
-          :body (with-current-buffer (map-elt state :buffer)
-                  (agent-shell--make-tool-call-permission-text
-                   :acp-request acp-request
-                   :client (map-elt state :client)
-                   :state state))
-          :expanded t
-          :navigation 'never)
-         (agent-shell-jump-to-latest-permission-button-row)
-         (when-let (((map-elt state :buffer))
-                    (viewport-buffer (agent-shell-viewport--buffer
-                                      :shell-buffer (map-elt state :buffer)
-                                      :existing-only t)))
-           (with-current-buffer viewport-buffer
-             (agent-shell-jump-to-latest-permission-button-row)))
+            :block-id (format "permission-%s" (map-nested-elt acp-request '(params toolCall toolCallId)))
+            :body (with-current-buffer (map-elt state :buffer)
+                    (agent-shell--make-tool-call-permission-text
+                     :acp-request acp-request
+                     :client (map-elt state :client)
+                     :state state))
+            :expanded t
+            :navigation 'never)
+           (agent-shell-jump-to-latest-permission-button-row)
+           (when-let (((map-elt state :buffer))
+                      (viewport-buffer (agent-shell-viewport--buffer
+                                        :shell-buffer (map-elt state :buffer)
+                                        :existing-only t)))
+             (with-current-buffer viewport-buffer
+               (agent-shell-jump-to-latest-permission-button-row))))
          (map-put! state :last-entry-type "session/request_permission"))
         ((equal (map-elt acp-request 'method) "fs/read_text_file")
          (agent-shell--on-fs-read-text-file-request
