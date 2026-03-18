@@ -2162,6 +2162,9 @@ DIFF should be in the form returned by `agent-shell--make-diff-info':
        :create-new t))
     ;; TODO: Mark buffer command with shell failure.
     (with-current-buffer shell-buffer
+      (agent-shell--emit-event :event 'error
+                               :data (list (cons :code (map-elt acp-error 'code))
+                                           (cons :message (map-elt acp-error 'message))))
       (shell-maker-finish-output :config shell-maker--config
                                  :success t))))
 
@@ -2220,6 +2223,7 @@ DIFF should be in the form returned by `agent-shell--make-diff-info':
 For example, shut down ACP client."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
+  (agent-shell--emit-event :event 'clean-up)
   (agent-shell--shutdown)
   ;; Kill any open diff buffers associated with tool calls.
   (map-do (lambda (_tool-call-id tool-call-data)
@@ -2668,6 +2672,16 @@ variable (see makunbound)"))
           (agent-shell-subscribe-to
            :shell-buffer shell-buffer
            :event 'session-selection-cancelled
+           :on-event (lambda (_event)
+                       (agent-shell-active-message-hide :active-message active-message)))
+          (agent-shell-subscribe-to
+           :shell-buffer shell-buffer
+           :event 'error
+           :on-event (lambda (_event)
+                       (agent-shell-active-message-hide :active-message active-message)))
+          (agent-shell-subscribe-to
+           :shell-buffer shell-buffer
+           :event 'clean-up
            :on-event (lambda (_event)
                        (agent-shell-active-message-hide :active-message active-message)))))
       ;; Display buffer if no-focus was nil, respecting agent-shell-display-action
@@ -3488,6 +3502,11 @@ Session events:
     :data contains :request-id, :tool-call-id, :option-id, :cancelled
   `turn-complete'       - Agent turn finished and prompt ready for input
     :data contains :stop-reason and :usage
+
+General events:
+  `error'               - ACP request failed
+    :data contains :code and :message
+  `clean-up'            - Buffer being killed, resources cleaned up
 
 Returns a subscription token for use with `agent-shell-unsubscribe'.
 
