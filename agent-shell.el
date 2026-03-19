@@ -5015,6 +5015,8 @@ The saved image file path is then inserted into the shell prompt.
 
 When PICK-SHELL is non-nil, prompt for which shell buffer to use."
   (interactive)
+  (unless (window-system)
+    (user-error "Clipboard image requires a window system"))
   (let* ((screenshots-dir (agent-shell--dot-subdir "screenshots"))
          (image-path (agent-shell--save-clipboard-image :destination-dir screenshots-dir))
          (shell-buffer (when pick-shell
@@ -5043,14 +5045,14 @@ Otherwise, invoke `yank' with ARG as usual.
 Needs external utilities.  See `agent-shell-clipboard-image-handlers'
 for details."
   (interactive "*P")
-  (let* ((screenshots-dir (agent-shell--dot-subdir "screenshots"))
-         (image-path (agent-shell--save-clipboard-image :destination-dir screenshots-dir
-                                                        :no-error t)))
-    (if image-path
-        (agent-shell-insert
-         :text (agent-shell--get-files-context :files (list image-path))
-         :shell-buffer (agent-shell--shell-buffer))
-      (yank arg))))
+  (if-let* (((window-system))
+            (screenshots-dir (agent-shell--dot-subdir "screenshots"))
+            (image-path (agent-shell--save-clipboard-image :destination-dir screenshots-dir
+                                                           :no-error t)))
+      (agent-shell-insert
+       :text (agent-shell--get-files-context :files (list image-path))
+       :shell-buffer (agent-shell--shell-buffer))
+    (yank arg)))
 
 ;;; Permissions
 
